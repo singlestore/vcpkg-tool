@@ -7,6 +7,7 @@
 #include <vcpkg/base/json.h>
 #include <vcpkg/base/message_sinks.h>
 #include <vcpkg/base/messages.h>
+#include <vcpkg/base/parallel-algorithms.h>
 #include <vcpkg/base/parse.h>
 #include <vcpkg/base/strings.h>
 #include <vcpkg/base/system.debug.h>
@@ -1088,40 +1089,40 @@ namespace
         void acquire_zips(View<const InstallPlanAction*> actions,
                           Span<Optional<ZipResource>> out_zip_paths) const override
         {
-            for (size_t idx = 0; idx < actions.size(); ++idx)
-            {
-                auto&& action = *actions[idx];
-                const auto& abi = action.package_abi().value_or_exit(VCPKG_LINE_INFO);
-                auto tmp = make_temp_archive_path(m_buildtrees, action.spec);
-                auto res = m_tool->download_file(make_object_path(m_prefix, abi), tmp);
-                if (res)
-                {
-                    out_zip_paths[idx].emplace(std::move(tmp), RemoveWhen::always);
-                }
-                else
-                {
-                    out_sink.println_warning(res.error());
-                }
-            }
+            parallel_transform(
+                actions, out_zip_paths.begin(), [&](const InstallPlanAction* plan) -> Optional<ZipResource> {
+                    auto&& action = *plan;
+                    const auto& abi = action.package_abi().value_or_exit(VCPKG_LINE_INFO);
+                    auto tmp = make_temp_archive_path(m_buildtrees, action.spec);
+                    auto res = m_tool->download_file(make_object_path(m_prefix, abi), tmp);
+                    if (res)
+                    {
+                        return ZipResource{ZipResource(std::move(tmp), RemoveWhen::always)};
+                    }
+                    else
+                    {
+                        out_sink.println_warning(res.error());
+                        return nullopt;
+                    }
+                });
         }
 
         bool can_precheck() const override { return true; }
 
         void precheck(View<const InstallPlanAction*> actions, Span<CacheAvailability> cache_status) const override
         {
-            for (size_t idx = 0; idx < actions.size(); ++idx)
-            {
-                auto&& action = *actions[idx];
+            parallel_transform(actions, cache_status.begin(), [&](const InstallPlanAction* plan) {
+                auto&& action = *plan;
                 const auto& abi = action.package_abi().value_or_exit(VCPKG_LINE_INFO);
                 if (m_tool->stat(make_object_path(m_prefix, abi)))
                 {
-                    cache_status[idx] = CacheAvailability::available;
+                    return CacheAvailability::available;
                 }
                 else
                 {
-                    cache_status[idx] = CacheAvailability::unavailable;
+                    return CacheAvailability::unavailable;
                 }
-            }
+            });
         }
 
         LocalizedString restored_message(size_t count,
@@ -1152,18 +1153,24 @@ namespace
         {
             if (!request.zip_path) return 0;
             const auto& zip_path = *request.zip_path.get();
-            size_t upload_count = 0;
-            for (const auto& [provider_id, source, cache_type] : m_prefixes)
+            std::atomic<size_t> upload_count = 0;
+            std::mutex cache_mutex;
+            parallel_for_each(m_prefixes, [&](const auto& prefix)
             {
-                if (cache_type == CacheType::ReadWrite && !cache_status.should_attempt_write_back(provider_id))
+                const auto& [provider_id, source, cache_type] = prefix;
                 {
-                    /// We already have this in the cache, so skip it
-                    continue;
+                    std::lock_guard lock(cache_mutex);
+                    if (cache_type == CacheType::ReadWrite && !cache_status.should_attempt_write_back(provider_id))
+                    {
+                        /// We already have this in the cache, so skip it
+                        return;
+                    }
                 }
 
                 auto res = m_tool->upload_file(make_object_path(source, request.package_abi), zip_path);
                 if (res)
                 {
+                    std::lock_guard lock(cache_mutex);
                     ++upload_count;
                     cache_status.mark_written_back(provider_id);
                 }
@@ -1171,7 +1178,7 @@ namespace
                 {
                     msg_sink.println_warning(res.error());
                 }
-            }
+            });
             return upload_count;
         }
 
