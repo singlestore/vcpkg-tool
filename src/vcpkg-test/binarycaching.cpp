@@ -36,6 +36,8 @@ struct KnowNothingBinaryProvider : IReadBinaryProvider
     {
         return LocalizedString::from_raw("Nothing");
     }
+
+    ProviderId id() const override { return 1; }
 };
 
 TEST_CASE ("CacheStatus operations", "[BinaryCache]")
