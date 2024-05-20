@@ -1116,10 +1116,12 @@ namespace
                 const auto& abi = action.package_abi().value_or_exit(VCPKG_LINE_INFO);
                 if (m_tool->stat(make_object_path(m_prefix, abi)))
                 {
+                    fmt::println("#### Package {} found in cache", action.display_name());
                     return CacheAvailability::available;
                 }
                 else
                 {
+                    fmt::println("#### Package {} NOT found in cache", action.display_name());
                     return CacheAvailability::unavailable;
                 }
             });
