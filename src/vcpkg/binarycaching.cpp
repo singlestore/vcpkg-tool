@@ -245,6 +245,18 @@ namespace
     Path files_archive_parent_path(const std::string& abi) { return Path(abi.substr(0, 2)); }
     Path files_archive_subpath(const std::string& abi) { return files_archive_parent_path(abi) / (abi + ".zip"); }
 
+    StringView try_extract_abi_from_zip_file(const Path& zip_file)
+    {
+        StringView file_stem = zip_file.stem();
+        auto reverse_it =
+            std::find_if(file_stem.rbegin(), file_stem.rend(), [](char ch) { return !std::isxdigit(ch); });
+        if (reverse_it != file_stem.rend() && (*reverse_it) == '_')
+        {
+            return {reverse_it.base(), file_stem.end()};
+        }
+        return {};
+    }
+
     struct FilesWriteBinaryProvider : IWriteBinaryProvider
     {
         FilesWriteBinaryProvider(std::vector<Path>&& dirs) : m_dirs(std::move(dirs)) { }
@@ -326,7 +338,7 @@ namespace
     // - IReadBinaryProvider::precheck()
     struct ZipReadBinaryProvider : IReadBinaryProvider
     {
-        ZipReadBinaryProvider(const ZipTool& zip) : m_zip(zip) { }
+        ZipReadBinaryProvider(const ZipTool& zip, Optional<Path> local_cache_folder = {}) : m_zip(zip), m_local_cache_folder(local_cache_folder) { }
 
         struct UnzipJob
         {
@@ -383,12 +395,27 @@ namespace
                             DiagKind::Note, job.zip_resource->path, msg::format(msgWhileExtractingThisArchive)});
                     }
                 }
-
-                if (job.zip_resource->to_remove == RemoveWhen::always)
-                {
-                    fs.remove(job.zip_resource->path, IgnoreErrors{});
-                }
             });
+
+            for (auto&& job : jobs)
+            {
+                const auto zip_resource = job.zip_resource;
+
+                if (job.success)
+                {
+                    if (auto new_path = try_write_back_zip_file(context, zip_resource->path, fs))
+                    {
+                        Debug::print("Copied ", zip_resource->path, " to ", *(new_path.get()), "\n");
+                        continue;
+                    }
+                }
+
+                if (zip_resource->to_remove == RemoveWhen::always)
+                {
+                    fs.remove(zip_resource->path, IgnoreErrors{});
+                    Debug::print("Removed ", zip_resource->path, '\n');
+                }
+            }
 
             for (auto&& job : jobs)
             {
@@ -401,6 +428,31 @@ namespace
                                        msg::format(msgExtractedInto, msg::path = *job.package_dir)});
                 }
             }
+        }
+
+        [[nodiscard]] Optional<Path> try_write_back_zip_file(DiagnosticContext& context, const Path& zip_file, const Filesystem& fs) const
+        {
+            if (!m_local_cache_folder)
+            {
+                return {};
+            }
+
+            const StringView abi = try_extract_abi_from_zip_file(zip_file);
+            if (abi.empty())
+            {
+                return {};
+            }
+
+            const Path& local_cache_folder = *m_local_cache_folder.get();
+            Path new_path = local_cache_folder / files_archive_subpath(std::string(abi));
+            if (fs.exists(new_path, IgnoreErrors{}))
+            {
+                return {};
+            }
+
+            fs.create_directories(context, new_path.parent_path());
+            fs.copy_file(context, zip_file, new_path, CopyOptions::overwrite_existing);
+            return new_path;
         }
 
         // For every action denoted by actions, at corresponding indicies in out_zips, stores a ZipResource indicating
@@ -416,6 +468,7 @@ namespace
 
     protected:
         ZipTool m_zip;
+        Optional<Path> m_local_cache_folder;
     };
 
     struct FilesReadBinaryProvider : ZipReadBinaryProvider
@@ -1014,8 +1067,9 @@ namespace
         ObjectStorageProvider(const ZipTool& zip,
                               const Path& buildtrees,
                               std::string&& prefix,
-                              const std::shared_ptr<const IObjectStorageTool>& tool)
-            : ZipReadBinaryProvider(zip), m_buildtrees(buildtrees), m_prefix(std::move(prefix)), m_tool(tool)
+                              const std::shared_ptr<const IObjectStorageTool>& tool,
+                              Optional<Path> local_cache_folder)
+            : ZipReadBinaryProvider(zip, std::move(local_cache_folder)), m_buildtrees(buildtrees), m_prefix(std::move(prefix)), m_tool(tool)
         {
         }
 
@@ -2763,22 +2817,28 @@ namespace vcpkg
                         std::make_unique<HttpGetBinaryProvider>(zip_tool, buildtrees, std::move(url), s.secrets));
                 }
 
+                Optional<Path> local_cache_folder;
+                if (!s.archives_to_write.empty())
+                {
+                    local_cache_folder = s.archives_to_write.front();
+                }
+
                 for (auto&& prefix : s.gcs_read_prefixes)
                 {
                     m_config.read.push_back(
-                        std::make_unique<ObjectStorageProvider>(zip_tool, buildtrees, std::move(prefix), gcs_tool));
+                        std::make_unique<ObjectStorageProvider>(zip_tool, buildtrees, std::move(prefix), gcs_tool, local_cache_folder));
                 }
 
                 for (auto&& prefix : s.aws_read_prefixes)
                 {
                     m_config.read.push_back(
-                        std::make_unique<ObjectStorageProvider>(zip_tool, buildtrees, std::move(prefix), aws_tool));
+                        std::make_unique<ObjectStorageProvider>(zip_tool, buildtrees, std::move(prefix), aws_tool, local_cache_folder));
                 }
 
                 for (auto&& prefix : s.cos_read_prefixes)
                 {
                     m_config.read.push_back(
-                        std::make_unique<ObjectStorageProvider>(zip_tool, buildtrees, std::move(prefix), cos_tool));
+                        std::make_unique<ObjectStorageProvider>(zip_tool, buildtrees, std::move(prefix), cos_tool, local_cache_folder));
                 }
 
                 if (!s.upkg_templates_to_get.empty())
