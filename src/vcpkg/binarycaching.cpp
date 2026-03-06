@@ -1083,8 +1083,7 @@ namespace
                           View<const InstallPlanAction*> actions,
                           Span<Optional<ZipResource>> out_zip_paths) const override
         {
-            for (size_t idx = 0; idx < actions.size(); ++idx)
-            {
+            execute_in_parallel(actions.size(), [&](size_t idx) {
                 auto&& action = *actions[idx];
                 const auto& abi = action.package_abi_or_exit(VCPKG_LINE_INFO);
                 auto tmp = make_temp_archive_path(m_buildtrees, action.spec, abi);
@@ -1097,7 +1096,7 @@ namespace
                         out_zip_paths[idx].emplace(std::move(tmp), RemoveWhen::always);
                     }
                 }
-            }
+            });
         }
 
         void precheck(DiagnosticContext& context,
@@ -1105,8 +1104,7 @@ namespace
                       View<const InstallPlanAction*> actions,
                       Span<CacheAvailability> cache_status) const override
         {
-            for (size_t idx = 0; idx < actions.size(); ++idx)
-            {
+            execute_in_parallel(actions.size(), [&](size_t idx) {
                 auto&& action = *actions[idx];
                 const auto& abi = action.package_abi_or_exit(VCPKG_LINE_INFO);
                 WarningDiagnosticContext wdc{context};
@@ -1119,7 +1117,7 @@ namespace
                 {
                     cache_status[idx] = CacheAvailability::unavailable;
                 }
-            }
+            });
         }
 
         LocalizedString restored_message(size_t count,
